@@ -1,0 +1,59 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+.DS_Store
+dist
+dist-ssr
+coverage
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+*.tsbuildinfo
+
+.eslintcache
+
+# Cypress
+/cypress/videos/
+/cypress/screenshots/
+
+# Vitest
+__screenshots__/
+
+# Vite
+*.timestamp-*-*.mjs
+# 依赖库
+node_modules/
+dist/
+
+# 数据库文件 (绝对不能上传，否则部署时会冲突)
+server/db/*.db
+server/db/*.db-journal
+
+# 图片上传目录 (通常不上传用户生成的图片)
+server/uploads/*
+!server/uploads/.gitkeep
+
+# 环境变量和日志
+.env
+*.log
+npm-debug.log*
+
+# 系统文件
+.DS_Store
+Thumbs.db
