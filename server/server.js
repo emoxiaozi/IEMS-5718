@@ -4,6 +4,7 @@ const express = require("express");
 const sqlite3 = require("sqlite3").verbose();
 const multer = require("multer");
 const sharp = require("sharp");
+const nodemailer = require("nodemailer");
 
 const crypto = require("crypto");
 const bcrypt = require("bcryptjs");
@@ -218,6 +219,17 @@ app.post("/api/auth/change-password", async (req, res) => {
   }
 });
 
+// --- Email Configuration (QQ Mail) ---
+const transporter = nodemailer.createTransport({
+  service: "qq",
+  port: 465,
+  secure: true, // 使用 SSL
+  auth: {
+    user: "2210530985@qq.com", // 需替换为你的QQ邮箱
+    pass: "fgfpwxqfbpgfeaii"         // 需替换为你的QQ邮箱授权码 (不是登录密码)
+  }
+});
+
 // --- Email Verification Code ---
 
 app.post("/api/auth/send-code", async (req, res) => {
@@ -244,10 +256,23 @@ app.post("/api/auth/send-code", async (req, res) => {
     expires: Date.now() + 5 * 60 * 1000
   };
 
-    // 模拟发送：在控制台打印
-    console.log(`\n[EMAIL SIMULATION] To: ${email}\n[EMAIL SIMULATION] Code: ${code}\n`);
+ 
+    const mailOptions = {
+      from: '"Dummy Shop" <2210530985@qq.com>', 
+      to: email,
+      subject: "Your Verification Code - Dummy Shop",
+      text: `Your verification code is: ${code}. It will expire in 5 minutes.`,
+      html: `<b>Your verification code is: <span style="font-size: 20px; color: #3498db;">${code}</span></b><p>It will expire in 5 minutes.</p>`
+    };
 
-    res.json({ ok: true, message: "Verification code sent (Check server console)" });
+    try {
+      await transporter.sendMail(mailOptions);
+      console.log(`✅ Email sent to ${email}`);
+      res.json({ ok: true, message: "Verification code sent to your email." });
+    } catch (mailErr) {
+      console.error("Mail sending failed:", mailErr);
+      res.status(500).json({ error: "Failed to send email. Please try again later." });
+    }
   } catch (e) {
     console.error("Send code error:", e);
     res.status(500).json({ error: "An internal error occurred." });
@@ -336,6 +361,29 @@ async function ensureDbInitialized() {
     if (firstTime) {
       await runSqlFile(db, INIT_SQL_PATH);
       console.log("✅ SQLite initialized from init.sql");
+      
+      // 动态插入默认用户，确保哈希值正确
+      const defaultPassword = "password123";
+      const hashedPw = await bcrypt.hash(defaultPassword, 10);
+      
+      await new Promise((resolve, reject) => {
+        db.run(
+          "INSERT OR REPLACE INTO users (email, password, role) VALUES (?, ?, ?), (?, ?, ?)",
+          [
+            "admin@example.com", hashedPw, "admin",
+            "user@example.com", hashedPw, "user"
+          ],
+          (err) => (err ? reject(err) : resolve())
+        );
+      });
+      console.log("✅ Default users (admin@example.com / user@example.com) created with password: 'password123'");
+    } else {
+      // 检查管理员角色是否正确（防止部署时角色丢失）
+      const admin = await dbGet(db, "SELECT role FROM users WHERE email = ?", ["admin@example.com"]);
+      if (admin && admin.role !== "admin") {
+        await db.run("UPDATE users SET role = 'admin' WHERE email = ?", ["admin@example.com"]);
+        console.log("✅ Fixed admin role for admin@example.com");
+      }
     }
   } finally {
     db.close();
