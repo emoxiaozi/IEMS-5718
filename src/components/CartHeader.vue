@@ -21,6 +21,9 @@
           <RouterLink to="/change-password" @click="isUserDropdownOpen = false" class="dropdown-item">
             Change Password
           </RouterLink>
+          <RouterLink v-if="user.role !== 'admin'" to="/shop?view=orders" @click="isUserDropdownOpen = false" class="dropdown-item">
+            My Orders
+          </RouterLink>
           <template v-if="user.role === 'admin'">
             <RouterLink to="/admin/categories" @click="isUserDropdownOpen = false" class="dropdown-item">
               Admin Categories

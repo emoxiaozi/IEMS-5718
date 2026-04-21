@@ -19,7 +19,7 @@
       Your cart is empty.
     </div>
 
-    <div v-if="cartItems.length" style="margin-top: 12px;">
+    <form v-if="cartItems.length" style="margin-top: 12px;" @submit.prevent="handleCheckout">
       <ul class="cart-page-list">
         <li class="cart-page-row" v-for="it in cartItems" :key="it.pid">
           <div class="cart-page-left">
@@ -66,12 +66,15 @@
         <strong>${{ formatPrice(total) }}</strong>
       </div>
 
-      <div style="margin-top: 12px; display:flex; gap: 12px;">
+      <div style="margin-top: 12px; display:flex; gap: 12px; justify-content:center;">
         <button type="button" class="add-to-cart" @click="clearAll">
           Clear cart
         </button>
+        <button type="submit" class="add-to-cart" :disabled="checkoutLoading">
+          {{ checkoutLoading ? "Creating PayPal Order..." : "Checkout with PayPal" }}
+        </button>
       </div>
-    </div>
+    </form>
   </main>
 
   <footer class="site-footer"></footer>
@@ -85,6 +88,7 @@ import { setCartQty, removeFromCart, clearCart } from "../api/cart";
 import CartHeader from "../components/CartHeader.vue";
 
 const loading = ref(false);
+const checkoutLoading = ref(false);
 const error = ref("");
 
 const cartItems = ref([]); // 展示用（带 name/price/subtotal）
@@ -178,6 +182,40 @@ async function remove(pid) {
 async function clearAll() {
   await clearCart();
   await refreshDetails();
+}
+
+async function getCsrfToken() {
+  const res = await fetch("/api/csrf-token");
+  const data = await res.json();
+  return data.csrfToken;
+}
+
+async function handleCheckout() {
+  if (!cartItems.value.length) return;
+  checkoutLoading.value = true;
+  error.value = "";
+  try {
+    const token = await getCsrfToken();
+    const items = cartItems.value.map((it) => ({ pid: it.pid, qty: it.qty }));
+    const res = await fetch("/api/checkout/create-order", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-CSRF-Token": token,
+      },
+      body: JSON.stringify({ items }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || "Failed to create PayPal order");
+    if (!data.approveUrl) throw new Error("Missing PayPal approval URL");
+
+    await clearCart();
+    window.location.href = data.approveUrl;
+  } catch (e) {
+    error.value = e?.message || "Checkout failed";
+  } finally {
+    checkoutLoading.value = false;
+  }
 }
 
 onMounted(async () => {

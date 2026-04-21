@@ -56,6 +56,49 @@
         Tip: If a category has products, delete products first (backend blocks deletion).
       </p>
     </section>
+
+    <section style="margin-top: 24px;">
+      <div style="display:flex; align-items:center; justify-content:space-between; gap:12px;">
+        <h2 style="margin:0;">Orders</h2>
+        <button type="button" @click="loadOrders">Refresh</button>
+      </div>
+
+      <p v-if="ordersErr" style="margin-top: 8px; color:#b00;">{{ ordersErr }}</p>
+      <p v-if="ordersLoading" style="margin-top: 8px;">Loading...</p>
+
+      <div v-if="!ordersLoading && orders.length" style="margin-top: 8px; overflow:auto;">
+        <table border="1" cellpadding="8" cellspacing="0" style="width: 100%;">
+          <thead>
+            <tr>
+              <th style="width: 80px;">oid</th>
+              <th style="width: 170px;">created_at</th>
+              <th>user</th>
+              <th style="width: 120px;">total</th>
+              <th style="width: 140px;">status</th>
+              <th>items</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="x in orders" :key="x.order.oid">
+              <td>{{ x.order.oid }}</td>
+              <td>{{ x.order.created_at }}</td>
+              <td>{{ x.order.user_email || x.order.customer_email || "" }}</td>
+              <td>{{ x.order.currency }} {{ Number(x.order.total).toFixed(2) }}</td>
+              <td>{{ x.order.payment_status }}</td>
+              <td>
+                <ul style="margin:0; padding-left:18px;">
+                  <li v-for="it in x.items" :key="it.pid + '-' + it.qty">
+                    {{ it.name }} × {{ it.qty }} ({{ x.order.currency }} {{ Number(it.price).toFixed(2) }})
+                  </li>
+                </ul>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p v-if="!ordersLoading && !ordersErr && !orders.length" style="margin-top: 8px; opacity:.8;">No orders.</p>
+    </section>
   </main>
 </template>
 
@@ -69,6 +112,10 @@ const categories = ref([]);
 const newName = ref("");
 const msg = ref("");
 const err = ref("");
+
+const orders = ref([]);
+const ordersLoading = ref(false);
+const ordersErr = ref("");
 
 const editNames = reactive({});
 function sanitizeName(s) {
@@ -159,8 +206,23 @@ async function deleteCategory(catid) {
   }
 }
 
+async function loadOrders() {
+  ordersLoading.value = true;
+  ordersErr.value = "";
+  try {
+    const data = await fetchJSON("/api/admin/orders");
+    orders.value = Array.isArray(data.orders) ? data.orders : [];
+  } catch (e) {
+    ordersErr.value = e?.message || "Failed to load orders";
+    orders.value = [];
+  } finally {
+    ordersLoading.value = false;
+  }
+}
+
 onMounted(async () => {
   await checkAdmin();
   await loadCategories();
+  await loadOrders();
 });
 </script>
