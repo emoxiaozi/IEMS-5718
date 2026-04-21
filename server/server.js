@@ -10,8 +10,23 @@ const crypto = require("crypto");
 const bcrypt = require("bcryptjs");
 
 const app = express();
-app.use(express.json());
+app.use(
+  express.json({
+    verify: (req, res, buf) => {
+      req.rawBody = buf;
+    },
+  })
+);
 const session = require("express-session");
+
+const PAYPAL_BASE = process.env.PAYPAL_BASE || "https://api-m.sandbox.paypal.com";
+const PAYPAL_CLIENT_ID = process.env.PAYPAL_CLIENT_ID || "AbYyGa1FydSQRduZuKjmfCXfQBTVWrN7EfphMNXxdvG0qv0_v4xAMh15w9hzl3MbV5yJBooDP6yCzO9b";
+const PAYPAL_CLIENT_SECRET = process.env.PAYPAL_CLIENT_SECRET || "EKcdvqQ_XNgpvxGl6GeZ_s7pnOnOC4qmg42hPpJ26v30R4rjRYm8NKj6vXKJdv0bpHf5HTV317qFNwdg";
+const PAYPAL_CURRENCY = process.env.PAYPAL_CURRENCY || "HKD";
+const PAYPAL_MERCHANT_EMAIL = process.env.PAYPAL_MERCHANT_EMAIL || "sb-9n5wb50757871@business.example.com";
+const PAYPAL_WEBHOOK_ID = process.env.PAYPAL_WEBHOOK_ID || "98657034E7825460U";
+const PAYPAL_RETURN_URL = process.env.PAYPAL_RETURN_URL || "https://s39.iems5718.iecuhk.cc/shop";
+const PAYPAL_CANCEL_URL = process.env.PAYPAL_CANCEL_URL || "https://s39.iems5718.iecuhk.cc/cart";
 
 app.use(
   session({
@@ -34,6 +49,10 @@ function csrfTokenMiddleware(req, res, next) {
     req.session.csrfToken = crypto.randomBytes(24).toString("hex");
   }
   
+  if (req.path === "/api/paypal/webhook") {
+    return next();
+  }
+
   // 对于修改数据的请求进行校验
   if (["POST", "PUT", "DELETE", "PATCH"].includes(req.method)) {
     const clientToken = req.headers["x-csrf-token"] || req.body?._csrf;
@@ -345,12 +364,61 @@ function dbGet(db, sql, params = []) {
   });
 }
 
+function dbRun(db, sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.run(sql, params, function (err) {
+      if (err) return reject(err);
+      resolve({ lastID: this.lastID, changes: this.changes });
+    });
+  });
+}
+
 function sanitizeText(s, maxLen) {
   const t = String(s || "").replace(/[<>\u0000-\u001F\u007F]/g, "").trim();
   return maxLen ? t.slice(0, maxLen) : t;
 }
 function validateEmail(s) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(s || "").trim());
+}
+
+async function ensureOrdersSchema(db) {
+  const cols = await dbAll(db, "PRAGMA table_info(orders)");
+  const names = new Set((cols || []).map((c) => c.name));
+
+  const addCol = async (name, typeAndDefault) => {
+    if (names.has(name)) return;
+    await dbRun(db, `ALTER TABLE orders ADD COLUMN ${name} ${typeAndDefault}`);
+    names.add(name);
+  };
+
+  await addCol("user_email", "TEXT");
+  await addCol("currency", "TEXT");
+  await addCol("merchant_email", "TEXT");
+  await addCol("salt", "TEXT");
+  await addCol("digest", "TEXT");
+  await addCol("paypal_order_id", "TEXT");
+  await addCol("capture_id", "TEXT");
+  await addCol("payment_status", "TEXT NOT NULL DEFAULT 'CREATED'");
+
+  await dbRun(db, "CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_paypal_order_id ON orders(paypal_order_id)");
+  await dbRun(db, "CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_capture_id ON orders(capture_id)");
+
+  await dbRun(
+    db,
+    "CREATE TABLE IF NOT EXISTS paypal_events (event_id TEXT PRIMARY KEY, event_type TEXT, paypal_order_id TEXT, capture_id TEXT, processed_at TEXT NOT NULL DEFAULT (datetime('now')))"
+  );
+}
+
+function buildOrderDigest({ currency, merchantEmail, salt, items, total }) {
+  const sorted = [...items].sort((a, b) => a.pid - b.pid);
+  const parts = [
+    `currency=${currency}`,
+    `merchant=${merchantEmail}`,
+    `salt=${salt}`,
+    ...sorted.map((x) => `pid=${x.pid},qty=${x.qty},price=${x.unitPrice.toFixed(2)}`),
+    `total=${total.toFixed(2)}`,
+  ];
+  return crypto.createHash("sha256").update(parts.join("|"), "utf8").digest("hex");
 }
 
 // --- init DB if missing ---
@@ -915,4 +983,298 @@ ensureDbInitialized()
   app.post("/api/cart/clear", (req, res) => {
     req.session.cart = {};
     res.json({ ok: true });
+  });
+
+  app.post("/api/checkout/create-order", async (req, res) => {
+    if (!req.session.userId) return res.status(401).json({ error: "Please login before checkout" });
+    if (!PAYPAL_CLIENT_ID || !PAYPAL_CLIENT_SECRET) {
+      return res.status(500).json({ error: "PayPal credentials are not configured" });
+    }
+    if (!PAYPAL_MERCHANT_EMAIL) {
+      return res.status(500).json({ error: "PayPal merchant email is not configured" });
+    }
+
+    const items = Array.isArray(req.body?.items) ? req.body.items : [];
+    if (!items.length) return res.status(400).json({ error: "Cart is empty" });
+
+    const db = openDb();
+    try {
+      await ensureOrdersSchema(db);
+
+      const normalized = [];
+      for (const it of items) {
+        const pid = Number(it?.pid);
+        const qty = Number(it?.qty);
+        if (!Number.isInteger(pid) || pid <= 0) return res.status(400).json({ error: "invalid pid" });
+        if (!Number.isInteger(qty) || qty <= 0) return res.status(400).json({ error: "invalid qty" });
+
+        const row = await dbGet(db, "SELECT pid, name, price FROM products WHERE pid = ?", [pid]);
+        if (!row) return res.status(400).json({ error: `pid not found: ${pid}` });
+
+        normalized.push({
+          pid: row.pid,
+          name: row.name,
+          qty,
+          unitPrice: Number(row.price),
+          subtotal: Number(row.price) * qty,
+        });
+      }
+
+      const total = normalized.reduce((sum, x) => sum + x.subtotal, 0);
+      const salt = crypto.randomBytes(16).toString("hex");
+      const digest = buildOrderDigest({
+        currency: PAYPAL_CURRENCY,
+        merchantEmail: PAYPAL_MERCHANT_EMAIL,
+        salt,
+        items: normalized,
+        total,
+      });
+
+      const userEmail = String(req.session.userEmail || "");
+      const address = "PAYPAL";
+
+      const ins = await dbRun(
+        db,
+        "INSERT INTO orders (customer_name, customer_email, address, total, user_email, currency, merchant_email, salt, digest, payment_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [userEmail || "Member", userEmail || null, address, total, userEmail || null, PAYPAL_CURRENCY, PAYPAL_MERCHANT_EMAIL, salt, digest, "CREATED"]
+      );
+      const oid = ins.lastID;
+
+      for (const x of normalized) {
+        await dbRun(
+          db,
+          "INSERT INTO order_items (oid, pid, name, price, qty, subtotal) VALUES (?, ?, ?, ?, ?, ?)",
+          [oid, x.pid, x.name, x.unitPrice, x.qty, x.subtotal]
+        );
+      }
+
+      const basicToken = Buffer.from(`${PAYPAL_CLIENT_ID}:${PAYPAL_CLIENT_SECRET}`).toString("base64");
+      const tokenRes = await fetch(`${PAYPAL_BASE}/v1/oauth2/token`, {
+        method: "POST",
+        headers: {
+          "Authorization": `Basic ${basicToken}`,
+          "Content-Type": "application/x-www-form-urlencoded",
+        },
+        body: "grant_type=client_credentials",
+      });
+      const tokenData = await tokenRes.json();
+      if (!tokenRes.ok || !tokenData.access_token) {
+        return res.status(500).json({ error: "Failed to get PayPal access token" });
+      }
+
+      const orderRes = await fetch(`${PAYPAL_BASE}/v2/checkout/orders`, {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${tokenData.access_token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          intent: "CAPTURE",
+          purchase_units: [{
+            amount: {
+              currency_code: PAYPAL_CURRENCY,
+              value: total.toFixed(2),
+              breakdown: { item_total: { currency_code: PAYPAL_CURRENCY, value: total.toFixed(2) } },
+            },
+            items: normalized.map((x) => ({
+              name: x.name,
+              sku: String(x.pid),
+              quantity: String(x.qty),
+              unit_amount: { currency_code: PAYPAL_CURRENCY, value: x.unitPrice.toFixed(2) },
+            })),
+          }],
+          application_context: { return_url: PAYPAL_RETURN_URL, cancel_url: PAYPAL_CANCEL_URL },
+        }),
+      });
+
+      const orderData = await orderRes.json();
+      if (!orderRes.ok) return res.status(500).json({ error: orderData?.message || "Failed to create PayPal order" });
+
+      const approveUrl = (orderData.links || []).find((x) => x.rel === "approve")?.href;
+      if (!approveUrl) return res.status(500).json({ error: "PayPal approve URL not found" });
+
+      await dbRun(db, "UPDATE orders SET paypal_order_id = ? WHERE oid = ?", [orderData.id, oid]);
+
+      res.json({ ok: true, oid, digest, orderId: orderData.id, approveUrl });
+    } catch (e) {
+      console.error("Create checkout order error:", e);
+      res.status(500).json({ error: "Failed to create checkout order" });
+    } finally {
+      db.close();
+    }
+  });
+
+  app.post("/api/paypal/capture", async (req, res) => {
+    if (!req.session.userId) return res.status(401).json({ error: "Unauthorized" });
+    const orderId = String(req.body?.orderId || req.query?.orderId || req.query?.token || "");
+    if (!orderId) return res.status(400).json({ error: "orderId is required" });
+
+    const db = openDb();
+    try {
+      await ensureOrdersSchema(db);
+      const row = await dbGet(db, "SELECT oid, payment_status FROM orders WHERE paypal_order_id = ?", [orderId]);
+      if (!row) return res.status(404).json({ error: "order not found" });
+      if (row.payment_status === "COMPLETED") return res.json({ ok: true });
+
+      const captureData = await paypalJson("POST", `/v2/checkout/orders/${encodeURIComponent(orderId)}/capture`, {});
+      const cap = captureData?.purchase_units?.[0]?.payments?.captures?.[0];
+      const captureId = cap?.id || null;
+      await dbRun(db, "UPDATE orders SET payment_status = ?, capture_id = COALESCE(capture_id, ?) WHERE oid = ?", ["CAPTURED", captureId, row.oid]);
+
+      res.json({ ok: true, captureId });
+    } catch (e) {
+      console.error("PayPal capture error:", e);
+      res.status(500).json({ error: "Failed to capture PayPal order" });
+    } finally {
+      db.close();
+    }
+  });
+
+  app.post("/api/paypal/webhook", async (req, res) => {
+    const proto = req.headers["x-forwarded-proto"];
+    if (process.env.NODE_ENV === "production" && proto !== "https" && !req.secure) {
+      return res.status(400).send("HTTPS required");
+    }
+
+    const verified = await verifyPayPalWebhookSignature(req);
+    if (!verified) return res.status(400).send("Invalid signature");
+
+    const eventId = String(req.body?.id || "");
+    const eventType = String(req.body?.event_type || "");
+    const resource = req.body?.resource || {};
+
+    const paypalOrderId =
+      resource?.supplementary_data?.related_ids?.order_id ||
+      resource?.id ||
+      "";
+
+    const captureId = resource?.id || null;
+
+    if (!eventId || !paypalOrderId) return res.status(200).json({ ok: true });
+
+    const db = openDb();
+    try {
+      await ensureOrdersSchema(db);
+
+      const done = await dbGet(db, "SELECT event_id FROM paypal_events WHERE event_id = ?", [eventId]);
+      if (done) return res.json({ ok: true });
+
+      const orderRow = await dbGet(
+        db,
+        "SELECT oid, digest, salt, merchant_email, currency, payment_status FROM orders WHERE paypal_order_id = ?",
+        [paypalOrderId]
+      );
+
+      const ppOrder = await paypalJson("GET", `/v2/checkout/orders/${encodeURIComponent(paypalOrderId)}`);
+      const pu = ppOrder?.purchase_units?.[0];
+      const currency = String(pu?.amount?.currency_code || orderRow?.currency || PAYPAL_CURRENCY);
+      const ppItems = Array.isArray(pu?.items) ? pu.items : [];
+
+      const normalized = [];
+      for (const it of ppItems) {
+        const pid = Number(it?.sku);
+        const qty = Number(it?.quantity);
+        const unitPrice = Number(it?.unit_amount?.value);
+        if (!Number.isInteger(pid) || pid <= 0) continue;
+        if (!Number.isInteger(qty) || qty <= 0) continue;
+        if (!Number.isFinite(unitPrice) || unitPrice < 0) continue;
+        normalized.push({ pid, qty, unitPrice });
+      }
+
+      const total = normalized.reduce((s, x) => s + x.unitPrice * x.qty, 0);
+
+      let status = "IGNORED";
+      if (orderRow && orderRow.salt && orderRow.digest) {
+        const digest = buildOrderDigest({
+          currency,
+          merchantEmail: String(orderRow.merchant_email || PAYPAL_MERCHANT_EMAIL),
+          salt: String(orderRow.salt),
+          items: normalized,
+          total,
+        });
+
+        if (digest === orderRow.digest) {
+          status = "COMPLETED";
+          await dbRun(
+            db,
+            "UPDATE orders SET payment_status = ?, capture_id = COALESCE(capture_id, ?), currency = ? WHERE oid = ?",
+            ["COMPLETED", captureId, currency, orderRow.oid]
+          );
+        } else {
+          status = "DIGEST_MISMATCH";
+          await dbRun(db, "UPDATE orders SET payment_status = ? WHERE oid = ?", [status, orderRow.oid]);
+        }
+      }
+
+      await dbRun(
+        db,
+        "INSERT INTO paypal_events (event_id, event_type, paypal_order_id, capture_id) VALUES (?, ?, ?, ?)",
+        [eventId, eventType, paypalOrderId, captureId]
+      );
+
+      res.json({ ok: true, status });
+    } catch (e) {
+      console.error("PayPal webhook error:", e);
+      res.status(500).json({ error: "Webhook processing failed" });
+    } finally {
+      db.close();
+    }
+  });
+
+  app.get("/api/admin/orders", isAdmin, async (req, res) => {
+    const db = openDb();
+    try {
+      await ensureOrdersSchema(db);
+      const orders = await dbAll(
+        db,
+        "SELECT oid, created_at, customer_name, customer_email, total, user_email, currency, paypal_order_id, capture_id, payment_status FROM orders ORDER BY oid DESC LIMIT 50"
+      );
+
+      const result = [];
+      for (const o of orders) {
+        const items = await dbAll(
+          db,
+          "SELECT pid, name, price, qty, subtotal FROM order_items WHERE oid = ? ORDER BY itemid ASC",
+          [o.oid]
+        );
+        result.push({ order: o, items });
+      }
+
+      res.json({ orders: result });
+    } catch (e) {
+      res.status(500).json({ error: "Failed to load orders" });
+    } finally {
+      db.close();
+    }
+  });
+
+  app.get("/api/member/orders/recent", async (req, res) => {
+    const userEmail = String(req.session.userEmail || "");
+    if (!req.session.userId || !userEmail) return res.status(401).json({ error: "Unauthorized" });
+
+    const db = openDb();
+    try {
+      await ensureOrdersSchema(db);
+      const orders = await dbAll(
+        db,
+        "SELECT oid, created_at, total, currency, paypal_order_id, payment_status FROM orders WHERE user_email = ? ORDER BY oid DESC LIMIT 5",
+        [userEmail]
+      );
+
+      const result = [];
+      for (const o of orders) {
+        const items = await dbAll(
+          db,
+          "SELECT pid, name, price, qty, subtotal FROM order_items WHERE oid = ? ORDER BY itemid ASC",
+          [o.oid]
+        );
+        result.push({ order: o, items });
+      }
+
+      res.json({ orders: result });
+    } catch (e) {
+      res.status(500).json({ error: "Failed to load orders" });
+    } finally {
+      db.close();
+    }
   });

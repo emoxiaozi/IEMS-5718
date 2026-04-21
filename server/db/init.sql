@@ -32,7 +32,22 @@ CREATE TABLE IF NOT EXISTS orders (
   customer_name TEXT NOT NULL,
   customer_email TEXT,
   address TEXT NOT NULL,
-  total REAL NOT NULL
+  total REAL NOT NULL,
+  user_email TEXT,
+  currency TEXT,
+  merchant_email TEXT,
+  salt TEXT,
+  digest TEXT,
+  paypal_order_id TEXT,
+  capture_id TEXT,
+  payment_status TEXT NOT NULL DEFAULT 'CREATED'
+);  user_email TEXT,
+  currency TEXT,
+  merchant_email TEXT,
+  salt TEXT,
+  digest TEXT,
+  paypal_order_id TEXT,
+  payment_status TEXT NOT NULL DEFAULT 'CREATED'
 );
 
 CREATE TABLE IF NOT EXISTS order_items (
@@ -45,6 +60,17 @@ CREATE TABLE IF NOT EXISTS order_items (
   subtotal REAL NOT NULL,
   FOREIGN KEY(oid) REFERENCES orders(oid) ON DELETE CASCADE
 );
+
+CREATE TABLE IF NOT EXISTS paypal_events (
+  event_id TEXT PRIMARY KEY,
+  event_type TEXT,
+  paypal_order_id TEXT,
+  capture_id TEXT,
+  processed_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_paypal_order_id ON orders(paypal_order_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_capture_id ON orders(capture_id);
 
 CREATE TABLE IF NOT EXISTS users (
   userid INTEGER PRIMARY KEY AUTOINCREMENT,
