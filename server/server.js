@@ -6,8 +6,61 @@ const multer = require("multer");
 const sharp = require("sharp");
 const nodemailer = require("nodemailer");
 
+const http = require("http");
+const https = require("https");
+const { URL } = require("url");
+
 const crypto = require("crypto");
 const bcrypt = require("bcryptjs");
+
+async function fetchCompat(input, init = {}) {
+  const url = input instanceof URL ? input : new URL(String(input));
+  const lib = url.protocol === "https:" ? https : http;
+  const method = String(init.method || "GET").toUpperCase();
+  const headers = init.headers || {};
+  const body = init.body;
+
+  return await new Promise((resolve, reject) => {
+    const req = lib.request(
+      {
+        protocol: url.protocol,
+        hostname: url.hostname,
+        port: url.port || undefined,
+        path: `${url.pathname}${url.search}`,
+        method,
+        headers,
+      },
+      (res) => {
+        const chunks = [];
+        res.on("data", (d) => chunks.push(d));
+        res.on("end", () => {
+          const buf = Buffer.concat(chunks);
+          const text = async () => buf.toString("utf8");
+          const json = async () => {
+            const t = await text();
+            if (!t) return {};
+            return JSON.parse(t);
+          };
+
+          resolve({
+            ok: (res.statusCode || 0) >= 200 && (res.statusCode || 0) < 300,
+            status: res.statusCode || 0,
+            statusText: res.statusMessage || "",
+            headers: res.headers,
+            text,
+            json,
+          });
+        });
+      }
+    );
+
+    req.on("error", reject);
+    if (body != null) req.write(body);
+    req.end();
+  });
+}
+
+const fetch = global.fetch ? global.fetch.bind(global) : fetchCompat;
 
 const app = express();
 app.use(
@@ -27,6 +80,110 @@ const PAYPAL_MERCHANT_EMAIL = process.env.PAYPAL_MERCHANT_EMAIL || "sb-9n5wb5075
 const PAYPAL_WEBHOOK_ID = process.env.PAYPAL_WEBHOOK_ID || "98657034E7825460U";
 const PAYPAL_RETURN_URL = process.env.PAYPAL_RETURN_URL || "https://s39.iems5718.iecuhk.cc/shop";
 const PAYPAL_CANCEL_URL = process.env.PAYPAL_CANCEL_URL || "https://s39.iems5718.iecuhk.cc/cart";
+
+let paypalTokenCache = null;
+
+async function getPayPalAccessToken() {
+  if (!PAYPAL_CLIENT_ID || !PAYPAL_CLIENT_SECRET) {
+    throw new Error("PayPal credentials are not configured");
+  }
+
+  const now = Date.now();
+  if (paypalTokenCache && paypalTokenCache.expiresAt - now > 60 * 1000) {
+    return paypalTokenCache.accessToken;
+  }
+
+  const basicToken = Buffer.from(`${PAYPAL_CLIENT_ID}:${PAYPAL_CLIENT_SECRET}`).toString("base64");
+  const tokenRes = await fetch(`${PAYPAL_BASE}/v1/oauth2/token`, {
+    method: "POST",
+    headers: {
+      Authorization: `Basic ${basicToken}`,
+      "Content-Type": "application/x-www-form-urlencoded",
+    },
+    body: "grant_type=client_credentials",
+  });
+
+  const tokenText = await tokenRes.text();
+  let tokenData = null;
+  try {
+    tokenData = JSON.parse(tokenText);
+  } catch {
+    tokenData = { raw: tokenText };
+  }
+
+  if (!tokenRes.ok || !tokenData?.access_token) {
+    const msg =
+      tokenData?.error_description ||
+      tokenData?.message ||
+      tokenData?.name ||
+      `PayPal token request failed (${tokenRes.status})`;
+    throw new Error(msg);
+  }
+
+  const expiresIn = Number(tokenData.expires_in || 0);
+  paypalTokenCache = {
+    accessToken: tokenData.access_token,
+    expiresAt: now + (Number.isFinite(expiresIn) && expiresIn > 0 ? expiresIn * 1000 : 8 * 60 * 1000),
+  };
+
+  return paypalTokenCache.accessToken;
+}
+
+async function paypalJson(method, apiPath, body) {
+  const token = await getPayPalAccessToken();
+  const res = await fetch(`${PAYPAL_BASE}${apiPath}`, {
+    method,
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: body == null || method === "GET" ? undefined : JSON.stringify(body),
+  });
+
+  const text = await res.text();
+  let data = null;
+  try {
+    data = text ? JSON.parse(text) : {};
+  } catch {
+    data = { raw: text };
+  }
+
+  if (!res.ok) {
+    const msg = data?.message || data?.error_description || data?.name || `PayPal API error (${res.status})`;
+    const err = new Error(msg);
+    err.status = res.status;
+    err.data = data;
+    throw err;
+  }
+
+  return data;
+}
+
+async function verifyPayPalWebhookSignature(req) {
+  if (!PAYPAL_WEBHOOK_ID) return false;
+
+  const transmissionId = String(req.headers["paypal-transmission-id"] || "");
+  const transmissionTime = String(req.headers["paypal-transmission-time"] || "");
+  const certUrl = String(req.headers["paypal-cert-url"] || "");
+  const authAlgo = String(req.headers["paypal-auth-algo"] || "");
+  const transmissionSig = String(req.headers["paypal-transmission-sig"] || "");
+
+  if (!transmissionId || !transmissionTime || !certUrl || !authAlgo || !transmissionSig) {
+    return false;
+  }
+
+  const out = await paypalJson("POST", "/v1/notifications/verify-webhook-signature", {
+    auth_algo: authAlgo,
+    cert_url: certUrl,
+    transmission_id: transmissionId,
+    transmission_sig: transmissionSig,
+    transmission_time: transmissionTime,
+    webhook_id: PAYPAL_WEBHOOK_ID,
+    webhook_event: req.body,
+  });
+
+  return String(out?.verification_status || "").toUpperCase() === "SUCCESS";
+}
 
 app.use(
   session({
@@ -1136,7 +1293,14 @@ ensureDbInitialized()
       return res.status(400).send("HTTPS required");
     }
 
-    const verified = await verifyPayPalWebhookSignature(req);
+    let verified = false;
+    try {
+      verified = await verifyPayPalWebhookSignature(req);
+    } catch (e) {
+      console.error("PayPal webhook verify error:", e);
+      return res.status(500).send("Webhook verification failed");
+    }
+
     if (!verified) return res.status(400).send("Invalid signature");
 
     const eventId = String(req.body?.id || "");

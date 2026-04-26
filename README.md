@@ -44,12 +44,68 @@ For ease of verification, the following test accounts are pre-configured in the 
 
 ---
 
-## 📦 Deployment & Execution
+## ✅ Quick Start (Local Dev)
 
-1.  **Install Dependencies**: `npm install`
-2.  **Build Frontend**: `npm run build`
-3.  **Start Backend**: `node server/server.js` (Recommended to use PM2 for production)
-4.  **Access URL**: `http://localhost:3000` (or your GCP VM External IP)
+1. **Install dependencies**
+   - Frontend: `npm install`
+   - Backend: `cd server && npm install`
+
+2. **Start backend API (port 3000)**
+   - `cd server && npm start`
+   - On first run, SQLite DB will be created at `server/db/app.db` and seeded from `server/db/init.sql`.
+
+3. **Start frontend dev server (port 5173)**
+   - In project root: `npm run dev`
+
+4. **Open in browser**: `http://localhost:5173`
+
+---
+
+## ⚙️ Configuration
+
+### PayPal (Sandbox)
+Set these environment variables before starting the backend (recommended for deployment):
+
+- `PAYPAL_BASE` (default: `https://api-m.sandbox.paypal.com`)
+- `PAYPAL_CLIENT_ID`
+- `PAYPAL_CLIENT_SECRET`
+- `PAYPAL_CURRENCY` (default: `HKD`)
+- `PAYPAL_MERCHANT_EMAIL`
+- `PAYPAL_WEBHOOK_ID`
+- `PAYPAL_RETURN_URL`
+- `PAYPAL_CANCEL_URL`
+
+### Email (Verification Codes)
+Email verification uses QQ Mail SMTP. Update the SMTP credentials in `server/server.js` (Nodemailer transporter config) to match your sender mailbox.
+
+---
+
+## 🚀 Production / Deployment
+
+- Build frontend: `npm run build` (outputs `dist/`)
+- Serve `dist/` with a static server (recommended: Nginx), and proxy the backend:
+  - `/api` -> `http://127.0.0.1:3000`
+  - `/uploads` -> `http://127.0.0.1:3000`
+- Start backend: `cd server && npm start`
+
+---
+
+## 📦 Packaging (Submission)
+
+- Exclude generated folders/files: `node_modules/`, `server/node_modules/`, `server/db/app.db`, `dist/` (unless your submission requires built assets).
+- Keep source and configs: `src/`, `server/`, `package*.json`, `vite.config.js`.
+
+Example (macOS) zip command:
+
+```bash
+cd /Users/nibaba/Desktop/assignment/iems-5718-assignment
+zip -r iems5718-assignment.zip . \
+  -x "node_modules/*" \
+  -x "server/node_modules/*" \
+  -x "server/db/app.db" \
+  -x "dist/*" \
+  -x ".git/*"
+```
 
 ---
 *Developed for IEMS 5718 Course Assignment.*
