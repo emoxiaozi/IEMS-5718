@@ -185,18 +185,24 @@ async function verifyPayPalWebhookSignature(req) {
   return String(out?.verification_status || "").toUpperCase() === "SUCCESS";
 }
 
+const isProd = process.env.NODE_ENV === "production";
+if (isProd) {
+  app.set("trust proxy", 1);
+}
+
 app.use(
   session({
     name: "iems5718_session_id",
-    secret: "iems5718-secure-session-secret-2024", 
+    secret: "iems5718-secure-session-secret-2024",
     resave: false,
-    saveUninitialized: false, 
+    saveUninitialized: false,
+    proxy: isProd,
     cookie: {
       httpOnly: true,
-      secure: true, 
+      secure: isProd,
       sameSite: "lax",
-      maxAge: 2 * 24 * 60 * 60 * 1000 
-    }
+      maxAge: 2 * 24 * 60 * 60 * 1000,
+    },
   })
 );
 
