@@ -272,50 +272,151 @@ function isAdmin(req, res, next) {
   res.status(403).json({ error: "Access denied. Admin privileges required." });
 }
 
+function generateLoginOtp() {
+  return String(Math.floor(100000 + Math.random() * 900000));
+}
+
 app.post("/api/auth/login", async (req, res) => {
-  const { email, password } = req.body;
+  const email = String(req.body?.email || "").trim().toLowerCase();
+  const password = String(req.body?.password || "");
   if (!email || !password) return res.status(400).json({ error: "Email and password required" });
 
   const db = openDb();
   try {
-    const user = await dbGet(db, "SELECT * FROM users WHERE email = ?", [email.trim().toLowerCase()]);
+    const user = await dbGet(db, "SELECT userid, email, password, role FROM users WHERE email = ?", [email]);
     if (!user) return res.status(401).json({ error: "Invalid email or password" });
 
     const match = await bcrypt.compare(password, user.password);
     if (!match) return res.status(401).json({ error: "Invalid email or password" });
 
-    // 防止 Session Fixation：登录成功后重新生成 session ID
-    const oldSession = { ...req.session };
-    req.session.regenerate((err) => {
-      if (err) {
-        console.error("Session regeneration error:", err);
-        return res.status(500).json({ error: "Login failed due to session error" });
+    const now = Date.now();
+    const existing = req.session.login2fa;
+    if (existing && existing.userId === user.userid && Number(existing.expiresAt || 0) > now) {
+      const lastSentAt = Number(existing.lastSentAt || 0);
+      if (now - lastSentAt < 30 * 1000) {
+        return res.json({ ok: true, requires2fa: true, message: "Verification code already sent" });
       }
-      
-    
-      req.session.userId = user.userid;
-      req.session.userEmail = user.email;
-      req.session.role = user.role;
-      
+    }
 
-      if (oldSession.csrfToken) {
-        req.session.csrfToken = oldSession.csrfToken;
-      }
+    const code = generateLoginOtp();
+    req.session.login2fa = {
+      userId: user.userid,
+      email: user.email,
+      role: user.role,
+      code,
+      expiresAt: now + 5 * 60 * 1000,
+      attemptsLeft: 5,
+      lastSentAt: now,
+    };
 
-      recordSessionLogin(req, user)
-        .then(() => {
-          res.json({ ok: true, user: { email: user.email, role: user.role } });
-        })
-        .catch((e) => {
-          console.error("Session record error:", e);
-          res.json({ ok: true, user: { email: user.email, role: user.role } });
-        });
-    });
+    const mailOptions = {
+      from: '"Dummy Shop" <2210530985@qq.com>',
+      to: user.email,
+      subject: "Your login verification code - Dummy Shop",
+      text: `Your login verification code is: ${code}. It will expire in 5 minutes.`,
+      html: `<p>Your login verification code is:</p><p style="font-size:20px;font-weight:700;letter-spacing:2px;">${code}</p><p>This code will expire in 5 minutes.</p>`,
+    };
+
+    await transporter.sendMail(mailOptions);
+    res.json({ ok: true, requires2fa: true, message: "Verification code sent" });
   } catch (e) {
     console.error("Login error:", e);
     res.status(500).json({ error: "An internal server error occurred. Please try again later." });
   } finally {
     db.close();
+  }
+});
+
+app.post("/api/auth/login/verify", async (req, res) => {
+  const code = String(req.body?.code || "").trim();
+  if (!code) return res.status(400).json({ error: "code is required" });
+
+  const pending = req.session.login2fa;
+  if (!pending) return res.status(400).json({ error: "No pending login" });
+
+  const now = Date.now();
+  const exp = Number(pending.expiresAt || 0);
+  if (!Number.isFinite(exp) || now > exp) {
+    req.session.login2fa = null;
+    return res.status(400).json({ error: "Verification code expired" });
+  }
+
+  const attemptsLeft = Number(pending.attemptsLeft || 0);
+  if (!Number.isFinite(attemptsLeft) || attemptsLeft <= 0) {
+    req.session.login2fa = null;
+    return res.status(400).json({ error: "Too many attempts" });
+  }
+
+  if (code !== String(pending.code || "")) {
+    pending.attemptsLeft = attemptsLeft - 1;
+    req.session.login2fa = pending;
+    return res.status(401).json({ error: "Invalid verification code" });
+  }
+
+  const oldSession = { ...req.session };
+  const userForSession = { userid: pending.userId, email: pending.email, role: pending.role };
+
+  req.session.regenerate((err) => {
+    if (err) {
+      console.error("Session regeneration error:", err);
+      return res.status(500).json({ error: "Login failed due to session error" });
+    }
+
+    if (oldSession.csrfToken) {
+      req.session.csrfToken = oldSession.csrfToken;
+    }
+
+    req.session.userId = userForSession.userid;
+    req.session.userEmail = userForSession.email;
+    req.session.role = userForSession.role;
+
+    recordSessionLogin(req, userForSession)
+      .then(() => {
+        res.json({ ok: true, user: { email: userForSession.email, role: userForSession.role } });
+      })
+      .catch((e) => {
+        console.error("Session record error:", e);
+        res.json({ ok: true, user: { email: userForSession.email, role: userForSession.role } });
+      });
+  });
+});
+
+app.post("/api/auth/login/resend", async (req, res) => {
+  const pending = req.session.login2fa;
+  if (!pending) return res.status(400).json({ error: "No pending login" });
+
+  const now = Date.now();
+  const exp = Number(pending.expiresAt || 0);
+  if (!Number.isFinite(exp) || now > exp) {
+    req.session.login2fa = null;
+    return res.status(400).json({ error: "Verification code expired" });
+  }
+
+  const lastSentAt = Number(pending.lastSentAt || 0);
+  if (Number.isFinite(lastSentAt) && now - lastSentAt < 30 * 1000) {
+    return res.json({ ok: true, requires2fa: true, message: "Please wait before resending" });
+  }
+
+  const code = generateLoginOtp();
+  pending.code = code;
+  pending.expiresAt = now + 5 * 60 * 1000;
+  pending.attemptsLeft = 5;
+  pending.lastSentAt = now;
+  req.session.login2fa = pending;
+
+  try {
+    const mailOptions = {
+      from: '"Dummy Shop" <2210530985@qq.com>',
+      to: String(pending.email || ""),
+      subject: "Your login verification code - Dummy Shop",
+      text: `Your login verification code is: ${code}. It will expire in 5 minutes.`,
+      html: `<p>Your login verification code is:</p><p style="font-size:20px;font-weight:700;letter-spacing:2px;">${code}</p><p>This code will expire in 5 minutes.</p>`,
+    };
+    await transporter.sendMail(mailOptions);
+    res.json({ ok: true, requires2fa: true, message: "Verification code resent" });
+  } catch (e) {
+    console.error("Resend login code error:", e);
+    res.status(500).json({ error: "Failed to resend verification code" });
   }
 });
 
