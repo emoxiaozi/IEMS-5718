@@ -99,6 +99,45 @@
 
       <p v-if="!ordersLoading && !ordersErr && !orders.length" style="margin-top: 8px; opacity:.8;">No orders.</p>
     </section>
+
+    <section style="margin-top: 24px;">
+      <div style="display:flex; align-items:center; justify-content:space-between; gap:12px;">
+        <h2 style="margin:0;">Sessions</h2>
+        <button type="button" @click="loadSessions">Refresh</button>
+      </div>
+
+      <p v-if="sessionsErr" style="margin-top: 8px; color:#b00;">{{ sessionsErr }}</p>
+      <p v-if="sessionsLoading" style="margin-top: 8px;">Loading...</p>
+
+      <div v-if="!sessionsLoading && sessions.length" style="margin-top: 8px; overflow:auto;">
+        <table border="1" cellpadding="8" cellspacing="0" style="width: 100%;">
+          <thead>
+            <tr>
+              <th>user</th>
+              <th style="width: 160px;">ip</th>
+              <th style="width: 180px;">last_seen</th>
+              <th style="width: 220px;">user_agent</th>
+              <th style="width: 140px;">actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="s in sessions" :key="s.sid">
+              <td>{{ s.user_email }} ({{ s.role }})</td>
+              <td>{{ s.ip || "" }}</td>
+              <td>{{ s.last_seen }}</td>
+              <td style="font-size:12px; opacity:.85;">{{ s.user_agent || "" }}</td>
+              <td>
+                <button type="button" :disabled="s.sid === currentSid" @click="revokeSession(s.sid)">
+                  {{ s.sid === currentSid ? "Current" : "Logout" }}
+                </button>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p v-if="!sessionsLoading && !sessionsErr && !sessions.length" style="margin-top: 8px; opacity:.8;">No active sessions.</p>
+    </section>
   </main>
 </template>
 
@@ -116,6 +155,11 @@ const err = ref("");
 const orders = ref([]);
 const ordersLoading = ref(false);
 const ordersErr = ref("");
+
+const sessions = ref([]);
+const sessionsLoading = ref(false);
+const sessionsErr = ref("");
+const currentSid = ref("");
 
 const editNames = reactive({});
 function sanitizeName(s) {
@@ -220,9 +264,37 @@ async function loadOrders() {
   }
 }
 
+async function loadSessions() {
+  sessionsLoading.value = true;
+  sessionsErr.value = "";
+  try {
+    const data = await fetchJSON("/api/admin/sessions");
+    sessions.value = Array.isArray(data.sessions) ? data.sessions : [];
+    currentSid.value = String(data.currentSid || "");
+  } catch (e) {
+    sessionsErr.value = e?.message || "Failed to load sessions";
+    sessions.value = [];
+    currentSid.value = "";
+  } finally {
+    sessionsLoading.value = false;
+  }
+}
+
+async function revokeSession(sid) {
+  if (!sid) return;
+  if (!confirm("Logout this session?")) return;
+  try {
+    await fetchJSON(`/api/admin/sessions/${encodeURIComponent(sid)}/revoke`, { method: "POST" });
+    await loadSessions();
+  } catch (e) {
+    sessionsErr.value = e?.message || "Failed to logout session";
+  }
+}
+
 onMounted(async () => {
   await checkAdmin();
   await loadCategories();
   await loadOrders();
+  await loadSessions();
 });
 </script>

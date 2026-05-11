@@ -92,7 +92,33 @@
 
           <label>
             Upload Image (JPEG/PNG/WEBP, ≤10MB)
-            <input type="file" accept="image/jpeg,image/png,image/webp" @change="onFileChange" />
+            <input ref="fileInputEl" type="file" accept="image/jpeg,image/png,image/webp" style="display:none;" @change="onFileChange" />
+
+            <div
+              class="dropzone"
+              :class="{ 'dropzone--active': isDragging }"
+              role="button"
+              tabindex="0"
+              @click="openFilePicker"
+              @keydown.enter.prevent="openFilePicker"
+              @keydown.space.prevent="openFilePicker"
+              @dragenter.prevent="onDragEnter"
+              @dragover.prevent="onDragOver"
+              @dragleave.prevent="onDragLeave"
+              @drop.prevent="onDrop"
+            >
+              <div v-if="previewUrl" class="dropzone__preview">
+                <img :src="previewUrl" alt="Preview" class="dropzone__img" />
+                <div class="dropzone__meta">
+                  <div class="dropzone__hint">Selected: {{ previewName }}</div>
+                  <button type="button" class="btn" @click.stop="clearSelectedFile">Remove</button>
+                </div>
+              </div>
+              <div v-else class="dropzone__empty">
+                <div class="dropzone__title">Drop an image here</div>
+                <div class="dropzone__hint">or click to choose a file</div>
+              </div>
+            </div>
           </label>
 
           <div style="display:flex; gap:10px; justify-content:flex-end; margin-top:6px;">
@@ -110,7 +136,7 @@
 </template>
 
 <script setup>
-import { onMounted, reactive, ref } from "vue";
+import { onBeforeUnmount, onMounted, reactive, ref } from "vue";
 import { RouterLink, useRouter } from "vue-router";
 import CartHeader from "../components/CartHeader.vue";
 
@@ -141,13 +167,91 @@ function sanitizeText(s, maxLen) {
 }
 
 let fileToUpload = null;
+const fileInputEl = ref(null);
+const isDragging = ref(false);
+const previewUrl = ref("");
+const previewName = ref("");
+
+function clearPreview() {
+  if (previewUrl.value) {
+    try { URL.revokeObjectURL(previewUrl.value); } catch {}
+  }
+  previewUrl.value = "";
+  previewName.value = "";
+}
+
+function clearSelectedFile() {
+  fileToUpload = null;
+  clearPreview();
+  if (fileInputEl.value) fileInputEl.value.value = "";
+}
+
+function setSelectedFile(f) {
+  if (!f) {
+    clearSelectedFile();
+    return;
+  }
+
+  if (!f.type || !["image/jpeg", "image/png", "image/webp"].includes(f.type)) {
+    modalError.value = "Only JPEG/PNG/WEBP images are allowed";
+    clearSelectedFile();
+    return;
+  }
+  if (f.size > 10 * 1024 * 1024) {
+    modalError.value = "Image must be ≤ 10MB";
+    clearSelectedFile();
+    return;
+  }
+
+  modalError.value = "";
+  fileToUpload = f;
+
+  clearPreview();
+  previewUrl.value = URL.createObjectURL(f);
+  previewName.value = f.name || "image";
+}
+
+function openFilePicker() {
+  if (fileInputEl.value) fileInputEl.value.click();
+}
+
+function onDragEnter() {
+  isDragging.value = true;
+}
+
+function onDragOver() {
+  isDragging.value = true;
+}
+
+function onDragLeave() {
+  isDragging.value = false;
+}
+
+function onDrop(e) {
+  isDragging.value = false;
+  const f = e?.dataTransfer?.files?.[0] || null;
+  setSelectedFile(f);
+}
 
 function formatPrice(v) {
   const n = Number(v);
   return Number.isFinite(n) ? n.toFixed(2) : v;
 }
 
-async function fetchJSON(url, options) {
+async function fetchJSON(url, options = {}) {
+  if (options.method && ["POST", "PUT", "DELETE", "PATCH"].includes(String(options.method).toUpperCase())) {
+    try {
+      const csrfRes = await fetch("/api/csrf-token");
+      const { csrfToken } = await csrfRes.json();
+      options.headers = {
+        ...options.headers,
+        "X-CSRF-Token": csrfToken,
+      };
+    } catch (e) {
+      throw new Error("Failed to fetch CSRF token");
+    }
+  }
+
   const res = await fetch(url, options);
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.error || `${res.status} ${res.statusText}`);
@@ -177,7 +281,7 @@ function openCreate() {
   form.name = "";
   form.price = 0;
   form.description = "";
-  fileToUpload = null;
+  clearSelectedFile();
   modalError.value = "";
 }
 
@@ -189,24 +293,19 @@ function openEdit(p) {
   form.name = p.name;
   form.price = Number(p.price);
   form.description = p.description || "";
-  fileToUpload = null;
+  clearSelectedFile();
   modalError.value = "";
 }
 
 function closeModal() {
   modal.open = false;
+  isDragging.value = false;
+  clearSelectedFile();
 }
 
 function onFileChange(e) {
   const f = e.target.files?.[0] || null;
-  if (!f) { fileToUpload = null; return; }
-  if (!["image/jpeg","image/png","image/webp"].includes(f.type) || f.size > 10 * 1024 * 1024) {
-    modalError.value = "Invalid image file";
-    fileToUpload = null;
-    e.target.value = "";
-    return;
-  }
-  fileToUpload = f;
+  setSelectedFile(f);
 }
 
 async function uploadImage(pid) {
@@ -306,6 +405,10 @@ onMounted(async () => {
     err.value = e.message || "Failed to load";
   }
 });
+
+onBeforeUnmount(() => {
+  clearPreview();
+});
 </script>
 
 <style scoped>
@@ -335,5 +438,54 @@ onMounted(async () => {
   border-radius: 16px;
   padding: 14px 16px;
   border: 1px solid #eee;
+}
+
+.dropzone {
+  margin-top: 8px;
+  border: 2px dashed #ddd;
+  border-radius: 14px;
+  background: #fafafa;
+  padding: 12px;
+  cursor: pointer;
+}
+
+.dropzone--active {
+  border-color: #111;
+  background: #fff;
+}
+
+.dropzone__empty {
+  display: grid;
+  gap: 4px;
+  justify-items: start;
+}
+
+.dropzone__title {
+  font-weight: 700;
+}
+
+.dropzone__hint {
+  font-size: 12px;
+  opacity: .8;
+}
+
+.dropzone__preview {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.dropzone__img {
+  width: 72px;
+  height: 72px;
+  object-fit: cover;
+  border-radius: 12px;
+  border: 1px solid #ddd;
+  background: #fff;
+}
+
+.dropzone__meta {
+  display: grid;
+  gap: 8px;
 }
 </style>

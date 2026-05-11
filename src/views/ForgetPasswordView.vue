@@ -1,43 +1,29 @@
 <template>
   <main class="content login-container">
     <div class="login-card">
-      <h1>Login</h1>
-      <form @submit.prevent="handleLogin" class="login-form">
+      <h1>Forgot Password</h1>
+
+      <form @submit.prevent="submit" class="login-form">
         <div class="form-group">
           <label for="email">Email</label>
-          <input 
-            type="email" 
-            id="email" 
-            v-model.trim="email" 
-            required 
-            placeholder="admin@example.com"
-          />
-        </div>
-        
-        <div class="form-group">
-          <label for="password">Password</label>
-          <input 
-            type="password" 
-            id="password" 
-            v-model="password" 
-            required 
-            placeholder="password123"
+          <input
+            id="email"
+            type="email"
+            v-model.trim="email"
+            required
+            placeholder="user@example.com"
           />
         </div>
 
         <button type="submit" class="login-btn" :disabled="loading">
-          {{ loading ? 'Logging in...' : 'Login' }}
+          {{ loading ? "Sending..." : "Send reset link" }}
         </button>
 
         <p v-if="error" class="error-msg">{{ error }}</p>
+        <p v-if="message" class="success-msg">{{ message }}</p>
 
         <div class="login-footer">
-          <p>Don't have an account?</p>
-          <RouterLink to="/register" class="register-link">Register Now</RouterLink>
-
-          <div style="margin-top: 10px;">
-            <RouterLink to="/forgot-password" class="register-link">Forgot password?</RouterLink>
-          </div>
+          <RouterLink to="/" class="register-link">Back to Login</RouterLink>
         </div>
       </form>
     </div>
@@ -46,13 +32,12 @@
 
 <script setup>
 import { ref } from "vue";
-import { useRouter, RouterLink } from "vue-router";
+import { RouterLink } from "vue-router";
 
 const email = ref("");
-const password = ref("");
 const loading = ref(false);
 const error = ref("");
-const router = useRouter();
+const message = ref("");
 
 async function getCsrfToken() {
   const res = await fetch("/api/csrf-token");
@@ -60,35 +45,28 @@ async function getCsrfToken() {
   return csrfToken;
 }
 
-async function handleLogin() {
+async function submit() {
   loading.value = true;
   error.value = "";
-  
+  message.value = "";
+
   try {
     const token = await getCsrfToken();
-    const res = await fetch("/api/auth/login", {
+    const res = await fetch("/api/auth/request-password-reset", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "X-CSRF-Token": token
+        "X-CSRF-Token": token,
       },
-      body: JSON.stringify({
-        email: email.value,
-        password: password.value
-      })
+      body: JSON.stringify({ email: email.value }),
     });
 
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || "Login failed");
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || "Request failed");
 
-    // 根据角色进行重定向
-    if (data.user && data.user.role === "admin") {
-      router.push("/admin/categories");
-    } else {
-      router.push("/shop");
-    }
+    message.value = "If the email exists, a password reset link has been sent.";
   } catch (e) {
-    error.value = e.message;
+    error.value = e?.message || "Request failed";
   } finally {
     loading.value = false;
   }
@@ -104,7 +82,7 @@ async function handleLogin() {
 }
 .login-card {
   width: 100%;
-  max-width: 400px;
+  max-width: 440px;
   padding: 2rem;
   background: white;
   border-radius: 16px;
@@ -114,8 +92,8 @@ async function handleLogin() {
 .login-form {
   display: flex;
   flex-direction: column;
-  gap: 1.5rem;
-  margin-top: 1.5rem;
+  gap: 1.25rem;
+  margin-top: 1.25rem;
 }
 .form-group {
   display: flex;
@@ -149,25 +127,20 @@ async function handleLogin() {
   color: #d32f2f;
   font-size: 0.9rem;
   text-align: center;
-  margin-top: 0.5rem;
-}
-
-.login-footer {
-  margin-top: 1.5rem;
-  text-align: center;
-  border-top: 1px solid #eee;
-  padding-top: 1rem;
-}
-
-.login-footer p {
   margin: 0;
-  color: #666;
-  font-size: 0.9rem;
 }
-
+.success-msg {
+  color: #2e7d32;
+  font-size: 0.9rem;
+  text-align: center;
+  margin: 0;
+}
+.login-footer {
+  margin-top: 0.75rem;
+  text-align: center;
+}
 .register-link {
   display: inline-block;
-  margin-top: 0.5rem;
   color: #111;
   font-weight: 600;
   text-decoration: underline;

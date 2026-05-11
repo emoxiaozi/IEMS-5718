@@ -190,12 +190,12 @@ app.use(
     name: "iems5718_session_id",
     secret: "iems5718-secure-session-secret-2024", 
     resave: false,
-    saveUninitialized: false, // 只有在有数据时才保存，提高安全性
+    saveUninitialized: false, 
     cookie: {
       httpOnly: true,
-      secure: false, // 在本地开发环境下（HTTP）需设置为 false，生产环境（HTTPS）应为 true
+      secure: true, 
       sameSite: "lax",
-      maxAge: 2 * 24 * 60 * 60 * 1000 // 2天有效期，满足 0 < 过期时间 < 3天
+      maxAge: 2 * 24 * 60 * 60 * 1000 
     }
   })
 );
@@ -210,7 +210,6 @@ function csrfTokenMiddleware(req, res, next) {
     return next();
   }
 
-  // 对于修改数据的请求进行校验
   if (["POST", "PUT", "DELETE", "PATCH"].includes(req.method)) {
     const clientToken = req.headers["x-csrf-token"] || req.body?._csrf;
     if (!clientToken || clientToken !== req.session.csrfToken) {
@@ -222,9 +221,45 @@ function csrfTokenMiddleware(req, res, next) {
 
 app.use(csrfTokenMiddleware);
 
-// 获取当前 Token 的接口
+
 app.get("/api/csrf-token", (req, res) => {
   res.json({ csrfToken: req.session.csrfToken });
+});
+
+app.use(async (req, res, next) => {
+  if (!req.path.startsWith("/api/")) return next();
+  if (!req.session?.userId) return next();
+
+  const sid = String(req.sessionID || "");
+  if (!sid) return next();
+
+  try {
+    const active = await isSessionActive(sid);
+    if (!active) {
+      req.session.destroy(() => {
+        res.clearCookie("iems5718_session_id");
+        res.status(401).json({ error: "Session revoked" });
+      });
+      return;
+    }
+
+    const now = Date.now();
+    const last = sessionTouchAt.get(sid) || 0;
+    if (now - last > 30 * 1000) {
+      sessionTouchAt.set(sid, now);
+      const db = openDb();
+      try {
+        await ensureSessionsSchema(db);
+        await dbRun(db, "UPDATE user_sessions SET last_seen = datetime('now') WHERE sid = ?", [sid]);
+      } finally {
+        db.close();
+      }
+    }
+
+    next();
+  } catch (e) {
+    next();
+  }
 });
 
 // --- Auth APIs ---
@@ -257,17 +292,24 @@ app.post("/api/auth/login", async (req, res) => {
         return res.status(500).json({ error: "Login failed due to session error" });
       }
       
-      // 重新填充用户信息
+    
       req.session.userId = user.userid;
       req.session.userEmail = user.email;
       req.session.role = user.role;
       
-      // 保持 CSRF Token (如果之前已生成)
+
       if (oldSession.csrfToken) {
         req.session.csrfToken = oldSession.csrfToken;
       }
 
-      res.json({ ok: true, user: { email: user.email, role: user.role } });
+      recordSessionLogin(req, user)
+        .then(() => {
+          res.json({ ok: true, user: { email: user.email, role: user.role } });
+        })
+        .catch((e) => {
+          console.error("Session record error:", e);
+          res.json({ ok: true, user: { email: user.email, role: user.role } });
+        });
     });
   } catch (e) {
     console.error("Login error:", e);
@@ -280,16 +322,14 @@ app.post("/api/auth/login", async (req, res) => {
 app.post("/api/auth/register", async (req, res) => {
   const { email, password, confirmPassword, code, adminKey } = req.body;
 
-  // 1. 基本非空校验
+
   if (!email || !password || !confirmPassword || !code) {
     return res.status(400).json({ error: "All fields are required" });
   }
 
-  // 预设的管理员注册秘钥
   const ADMIN_REGISTRATION_SECRET = "iems5718-admin-secret";
   const role = adminKey === ADMIN_REGISTRATION_SECRET ? "admin" : "user";
 
-  // 2. 验证码校验
   const sessionCode = req.session.emailCode;
   if (!sessionCode || sessionCode.email !== email.trim().toLowerCase() || sessionCode.code !== code) {
     return res.status(400).json({ error: "Invalid verification code" });
@@ -298,30 +338,26 @@ app.post("/api/auth/register", async (req, res) => {
     return res.status(400).json({ error: "Verification code expired" });
   }
 
-  // 3. 邮箱格式校验
   if (!validateEmail(email)) {
     return res.status(400).json({ error: "Invalid email format" });
   }
 
-  // 3. 密码一致性校验 (后端验证)
+
   if (password !== confirmPassword) {
     return res.status(400).json({ error: "Passwords do not match" });
   }
 
-  // 4. 密码强度校验 (简单示例：至少6位)
   if (password.length < 6) {
     return res.status(400).json({ error: "Password must be at least 6 characters long" });
   }
 
   const db = openDb();
   try {
-    // 5. 唯一性检查
     const existing = await dbGet(db, "SELECT userid FROM users WHERE email = ?", [email.trim().toLowerCase()]);
     if (existing) {
       return res.status(400).json({ error: "Email already registered" });
     }
 
-    // 6. 加盐哈希并存储
     const hashedPw = await bcrypt.hash(password, 10);
     await new Promise((resolve, reject) => {
       db.run(
@@ -341,11 +377,19 @@ app.post("/api/auth/register", async (req, res) => {
 });
 
 app.post("/api/auth/logout", (req, res) => {
-  req.session.destroy((err) => {
+  const sid = String(req.sessionID || "");
+  req.session.destroy(async (err) => {
     if (err) {
       return res.status(500).json({ error: "Logout failed" });
     }
-    res.clearCookie("iems5718_session_id"); // 清除浏览器中的 Cookie
+
+    try {
+      await recordSessionLogoutBySid(sid);
+    } catch (e) {
+      console.error("Session revoke error:", e);
+    }
+
+    res.clearCookie("iems5718_session_id");
     res.json({ ok: true });
   });
 });
@@ -379,11 +423,19 @@ app.post("/api/auth/change-password", async (req, res) => {
     await db.run("UPDATE users SET password = ? WHERE userid = ?", [hashedPw, userId]);
 
     // 3. 修改后强制登出
-    req.session.destroy((err) => {
+    const sid = String(req.sessionID || "");
+    req.session.destroy(async (err) => {
       if (err) {
         console.error("Session destruction error:", err);
         return res.status(500).json({ error: "Password changed but logout failed" });
       }
+
+      try {
+        await recordSessionLogoutBySid(sid);
+      } catch (e) {
+        console.error("Session revoke error:", e);
+      }
+
       res.clearCookie("iems5718_session_id");
       res.json({ ok: true, message: "Password updated successfully. Please login again." });
     });
@@ -401,12 +453,106 @@ const transporter = nodemailer.createTransport({
   port: 465,
   secure: true, // 使用 SSL
   auth: {
-    user: "2210530985@qq.com", // 需替换为你的QQ邮箱
-    pass: "fgfpwxqfbpgfeaii"         // 需替换为你的QQ邮箱授权码 (不是登录密码)
+    user: "2210530985@qq.com", 
+    pass: "fgfpwxqfbpgfeaii"        
   }
 });
 
 // --- Email Verification Code ---
+
+const APP_ORIGIN = process.env.APP_ORIGIN || "http://localhost:5173";
+
+app.post("/api/auth/request-password-reset", async (req, res) => {
+  const email = String(req.body?.email || "").trim().toLowerCase();
+  if (!email || !validateEmail(email)) {
+    return res.status(400).json({ error: "A valid email is required" });
+  }
+
+  const db = openDb();
+  try {
+    await ensurePasswordResetsSchema(db);
+
+    const user = await dbGet(db, "SELECT userid, email, role FROM users WHERE email = ?", [email]);
+    if (!user) {
+      return res.json({ ok: true });
+    }
+
+    const token = crypto.randomBytes(32).toString("hex");
+    const tokenHash = sha256Hex(token);
+
+    const expiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString();
+
+    await dbRun(
+      db,
+      "INSERT INTO password_resets (user_id, email, token_hash, expires_at) VALUES (?, ?, ?, ?)",
+      [user.userid, user.email, tokenHash, expiresAt]
+    );
+
+    const link = `${APP_ORIGIN}/reset-password?token=${encodeURIComponent(token)}`;
+
+    const mailOptions = {
+      from: '"Dummy Shop" <2210530985@qq.com>',
+      to: user.email,
+      subject: "Password Reset - Dummy Shop",
+      text: `Use this link to reset your password (valid for 15 minutes): ${link}`,
+      html: `<p>Click to reset your password (valid for 15 minutes):</p><p><a href="${link}">${link}</a></p>`,
+    };
+
+    await transporter.sendMail(mailOptions);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("Request password reset error:", e);
+    res.status(500).json({ error: "Failed to request password reset" });
+  } finally {
+    db.close();
+  }
+});
+
+app.post("/api/auth/reset-password", async (req, res) => {
+  const token = String(req.body?.token || "").trim();
+  const newPassword = String(req.body?.newPassword || "");
+  const confirmNewPassword = String(req.body?.confirmNewPassword || "");
+
+  if (!token) return res.status(400).json({ error: "token is required" });
+  if (!newPassword || !confirmNewPassword) return res.status(400).json({ error: "All fields are required" });
+  if (newPassword.length < 6) return res.status(400).json({ error: "New password must be at least 6 characters" });
+  if (newPassword !== confirmNewPassword) return res.status(400).json({ error: "Passwords do not match" });
+
+  const db = openDb();
+  try {
+    await ensurePasswordResetsSchema(db);
+
+    const tokenHash = sha256Hex(token);
+    const row = await dbGet(
+      db,
+      "SELECT rid, user_id, expires_at, used_at FROM password_resets WHERE token_hash = ?",
+      [tokenHash]
+    );
+
+    if (!row || row.used_at) return res.status(400).json({ error: "Invalid or used token" });
+
+    const exp = Date.parse(String(row.expires_at || ""));
+    if (!Number.isFinite(exp) || Date.now() > exp) {
+      return res.status(400).json({ error: "Token expired" });
+    }
+
+    const hashedPw = await bcrypt.hash(newPassword, 10);
+    await dbRun(db, "UPDATE users SET password = ? WHERE userid = ?", [hashedPw, row.user_id]);
+    await dbRun(db, "UPDATE password_resets SET used_at = datetime('now') WHERE rid = ?", [row.rid]);
+
+    try {
+      await ensureSessionsSchema(db);
+      await dbRun(db, "UPDATE user_sessions SET revoked_at = datetime('now') WHERE user_id = ? AND revoked_at IS NULL", [row.user_id]);
+    } catch {}
+
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("Reset password error:", e);
+    res.status(500).json({ error: "Failed to reset password" });
+  } finally {
+    db.close();
+  }
+});
 
 app.post("/api/auth/send-code", async (req, res) => {
   const { email } = req.body;
@@ -469,7 +615,10 @@ app.get("/api/auth/me", (req, res) => {
   });
 });
 app.use((req, res, next) => {
-  res.setHeader("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' http://localhost:5173; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self' http://localhost:3000 http://localhost:5173 ws://localhost:5173; font-src 'self' data:; object-src 'none'; base-uri 'self'; frame-ancestors 'self'; form-action 'self'; upgrade-insecure-requests");
+  res.setHeader(
+    "Content-Security-Policy",
+    "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' http://localhost:5173; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self' http://localhost:3000 http://localhost:5173 ws://localhost:5173; font-src 'self' data:; object-src 'none'; base-uri 'self'; frame-ancestors 'self'; frame-src 'self' https://www.facebook.com https://platform.twitter.com; form-action 'self'; upgrade-insecure-requests"
+  );
   res.setHeader("X-Content-Type-Options", "nosniff");
   res.setHeader("X-Frame-Options", "DENY");
   res.setHeader("Referrer-Policy", "no-referrer");
@@ -566,6 +715,81 @@ async function ensureOrdersSchema(db) {
   );
 }
 
+async function ensureSessionsSchema(db) {
+  await dbRun(
+    db,
+    "CREATE TABLE IF NOT EXISTS user_sessions (sid TEXT PRIMARY KEY, user_id INTEGER NOT NULL, user_email TEXT NOT NULL, role TEXT NOT NULL, ip TEXT, user_agent TEXT, created_at TEXT NOT NULL DEFAULT (datetime('now')), last_seen TEXT NOT NULL DEFAULT (datetime('now')), revoked_at TEXT, FOREIGN KEY(user_id) REFERENCES users(userid) ON DELETE CASCADE)"
+  );
+  await dbRun(db, "CREATE INDEX IF NOT EXISTS idx_user_sessions_user_id ON user_sessions(user_id)");
+  await dbRun(db, "CREATE INDEX IF NOT EXISTS idx_user_sessions_revoked ON user_sessions(revoked_at)");
+}
+
+async function ensurePasswordResetsSchema(db) {
+  await dbRun(
+    db,
+    "CREATE TABLE IF NOT EXISTS password_resets (rid INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, email TEXT NOT NULL, token_hash TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL DEFAULT (datetime('now')), expires_at TEXT NOT NULL, used_at TEXT, FOREIGN KEY(user_id) REFERENCES users(userid) ON DELETE CASCADE)"
+  );
+  await dbRun(db, "CREATE INDEX IF NOT EXISTS idx_password_resets_user_id ON password_resets(user_id)");
+  await dbRun(db, "CREATE INDEX IF NOT EXISTS idx_password_resets_used_at ON password_resets(used_at)");
+}
+
+function sha256Hex(s) {
+  return crypto.createHash("sha256").update(String(s), "utf8").digest("hex");
+}
+
+function getClientIp(req) {
+  const xf = req.headers["x-forwarded-for"];
+  const raw = Array.isArray(xf) ? xf[0] : String(xf || "");
+  const ip = raw.split(",")[0].trim();
+  return ip || String(req.ip || "");
+}
+
+const sessionTouchAt = new Map();
+
+async function recordSessionLogin(req, user) {
+  const sid = String(req.sessionID || "");
+  if (!sid || !user) return;
+
+  const db = openDb();
+  try {
+    await ensureSessionsSchema(db);
+    const ip = getClientIp(req).slice(0, 80);
+    const ua = String(req.headers["user-agent"] || "").slice(0, 200);
+    await dbRun(
+      db,
+      "INSERT OR REPLACE INTO user_sessions (sid, user_id, user_email, role, ip, user_agent, created_at, last_seen, revoked_at) VALUES (?, ?, ?, ?, ?, ?, COALESCE((SELECT created_at FROM user_sessions WHERE sid = ?), datetime('now')), datetime('now'), NULL)",
+      [sid, user.userid, user.email, user.role, ip, ua, sid]
+    );
+  } finally {
+    db.close();
+  }
+}
+
+async function recordSessionLogoutBySid(sid) {
+  const s = String(sid || "");
+  if (!s) return;
+  const db = openDb();
+  try {
+    await ensureSessionsSchema(db);
+    await dbRun(db, "UPDATE user_sessions SET revoked_at = datetime('now') WHERE sid = ?", [s]);
+  } finally {
+    db.close();
+  }
+}
+
+async function isSessionActive(sid) {
+  const s = String(sid || "");
+  if (!s) return false;
+  const db = openDb();
+  try {
+    await ensureSessionsSchema(db);
+    const row = await dbGet(db, "SELECT sid FROM user_sessions WHERE sid = ? AND revoked_at IS NULL", [s]);
+    return Boolean(row);
+  } finally {
+    db.close();
+  }
+}
+
 function buildOrderDigest({ currency, merchantEmail, salt, items, total }) {
   const sorted = [...items].sort((a, b) => a.pid - b.pid);
   const parts = [
@@ -610,6 +834,9 @@ async function ensureDbInitialized() {
         console.log("✅ Fixed admin role for admin@example.com");
       }
     }
+
+    await ensureSessionsSchema(db);
+    await ensurePasswordResetsSchema(db);
   } finally {
     db.close();
   }
@@ -639,14 +866,58 @@ app.get("/api/products", async (req, res) => {
     return res.status(400).json({ error: "catid is required and must be a positive integer" });
   }
 
+  const hasPagingParams =
+    req.query.page != null ||
+    req.query.pageSize != null ||
+    req.query.limit != null ||
+    req.query.offset != null;
+
+  let page = Number(req.query.page);
+  let pageSize = Number(req.query.pageSize);
+  let limit = Number(req.query.limit);
+  let offset = Number(req.query.offset);
+
+  if (!Number.isFinite(page) || page <= 0) page = 1;
+  if (!Number.isFinite(pageSize) || pageSize <= 0) pageSize = 12;
+
+  if (Number.isFinite(limit) && limit > 0) {
+    pageSize = limit;
+    if (Number.isFinite(offset) && offset >= 0) {
+      page = Math.floor(offset / pageSize) + 1;
+    }
+  } else {
+    limit = pageSize;
+    offset = (page - 1) * pageSize;
+  }
+
+  const maxPageSize = 50;
+  if (limit > maxPageSize) {
+    limit = maxPageSize;
+    pageSize = maxPageSize;
+  }
+
   const db = openDb();
   try {
+    if (!hasPagingParams) {
+      const rows = await dbAll(
+        db,
+        "SELECT pid, catid, name, price, description, image_path, thumb_path FROM products WHERE catid = ? ORDER BY pid ASC",
+        [catid]
+      );
+      return res.json(rows);
+    }
+
+    const totalRow = await dbGet(db, "SELECT COUNT(1) AS cnt FROM products WHERE catid = ?", [catid]);
+    const total = Number(totalRow?.cnt || 0);
+
     const rows = await dbAll(
       db,
-      "SELECT pid, catid, name, price, description, image_path, thumb_path FROM products WHERE catid = ? ORDER BY pid ASC",
-      [catid]
+      "SELECT pid, catid, name, price, description, image_path, thumb_path FROM products WHERE catid = ? ORDER BY pid ASC LIMIT ? OFFSET ?",
+      [catid, limit, offset]
     );
-    res.json(rows);
+
+    const hasMore = offset + rows.length < total;
+    res.json({ items: rows, total, page, pageSize, hasMore });
   } catch (e) {
     res.status(500).json({ error: String(e.message || e) });
   } finally {
@@ -1382,6 +1653,35 @@ ensureDbInitialized()
       res.status(500).json({ error: "Webhook processing failed" });
     } finally {
       db.close();
+    }
+  });
+
+  app.get("/api/admin/sessions", isAdmin, async (req, res) => {
+    const db = openDb();
+    try {
+      await ensureSessionsSchema(db);
+      const rows = await dbAll(
+        db,
+        "SELECT sid, user_email, role, ip, user_agent, created_at, last_seen FROM user_sessions WHERE revoked_at IS NULL ORDER BY last_seen DESC"
+      );
+      res.json({ sessions: rows, currentSid: String(req.sessionID || "") });
+    } catch (e) {
+      res.status(500).json({ error: "Failed to load sessions" });
+    } finally {
+      db.close();
+    }
+  });
+
+  app.post("/api/admin/sessions/:sid/revoke", isAdmin, async (req, res) => {
+    const sid = String(req.params.sid || "");
+    if (!sid) return res.status(400).json({ error: "sid is required" });
+
+    try {
+      await recordSessionLogoutBySid(sid);
+      req.sessionStore?.destroy?.(sid, () => {});
+      res.json({ ok: true });
+    } catch (e) {
+      res.status(500).json({ error: "Failed to revoke session" });
     }
   });
 

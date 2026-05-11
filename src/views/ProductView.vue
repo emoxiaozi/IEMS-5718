@@ -3,7 +3,7 @@
    <link rel="stylesheet" href="/css/styles.css" />
  <CartHeader>
   <template #right>
-    <RouterLink v-if="product" class="back-link" :to="`/shop?catid=${product.catid}`">
+    <RouterLink v-if="product" class="back-link" :to="categoryPath">
       ← Back to {{ categoryName }}
     </RouterLink>
     <RouterLink v-else class="back-link" to="/shop">
@@ -21,7 +21,7 @@
         </li>
 
         <li class="breadcrumb__item" v-if="product">
-          <RouterLink :to="`/shop?catid=${product.catid}`">{{ categoryName }}</RouterLink>
+          <RouterLink :to="categoryPath">{{ categoryName }}</RouterLink>
         </li>
 
         <li class="breadcrumb__item" aria-current="page">
@@ -86,14 +86,30 @@ import CartHeader from "../components/CartHeader.vue";
 const route = useRoute();
 
 const product = ref(null);
+const categories = ref([]);
 const error = ref("");
 const swiperEl = ref(null);
 let swiperInstance = null;
 
+function slugify(s) {
+  return String(s || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, "")
+    .replace(/\s+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "") || "item";
+}
+
 const categoryName = computed(() => {
   if (!product.value) return "Category";
-  
-  return Number(product.value.catid) === 1 ? "Coffee" : "Tea";
+  const c = categories.value.find((x) => x.catid === Number(product.value.catid));
+  return c?.name || "Category";
+});
+
+const categoryPath = computed(() => {
+  if (!product.value) return "/shop";
+  return `/${Number(product.value.catid)}-${slugify(categoryName.value)}/`;
 });
 
 
@@ -116,11 +132,32 @@ function formatPrice(v) {
   return n.toFixed(2);
 }
 
+async function loadCategories() {
+  try {
+    const res = await fetch("/api/categories");
+    const data = await res.json();
+    categories.value = Array.isArray(data) ? data : [];
+  } catch {
+    categories.value = [];
+  }
+}
+
+function getPidFromRoute() {
+  const raw = String(route.params.prodKey || route.params.pid || "");
+  const n = Number(raw.split("-")[0]);
+  return Number.isFinite(n) && n > 0 ? String(n) : "";
+}
+
 async function loadProduct() {
   error.value = "";
   product.value = null;
 
-  const pid = route.params.pid;
+  const pid = getPidFromRoute();
+  if (!pid) {
+    error.value = "Invalid product id";
+    return;
+  }
+
   try {
     const res = await fetch(`/api/products/${encodeURIComponent(pid)}`);
     if (!res.ok) throw new Error(`Request failed: ${res.status} ${res.statusText}`);
@@ -184,6 +221,7 @@ onMounted(async () => {
     });
   }
 
+  await loadCategories();
   await loadProduct();
   await nextTick();
   initSwiperIfReady();
@@ -191,7 +229,7 @@ onMounted(async () => {
 
 
 watch(
-  () => route.params.pid,
+  () => [route.params.pid, route.params.prodKey],
   async () => {
     await loadProduct();
     await nextTick();

@@ -8,6 +8,8 @@ import CartView from "../views/CartView.vue";
 import LoginView from "../views/LoginView.vue";
 import RegisterView from "../views/RegisterView.vue";
 import ChangePasswordView from "../views/ChangePasswordView.vue";
+import ForgetPasswordView from "../views/ForgetPasswordView.vue";
+import ResetPasswordView from "../views/ResetPasswordView.vue";
 
 
 const router = createRouter({
@@ -24,6 +26,16 @@ const router = createRouter({
       component: RegisterView,
     },
     {
+      path: "/forgot-password",
+      name: "forgot-password",
+      component: ForgetPasswordView,
+    },
+    {
+      path: "/reset-password",
+      name: "reset-password",
+      component: ResetPasswordView,
+    },
+    {
       path: "/change-password",
       name: "change-password",
       component: ChangePasswordView,
@@ -33,6 +45,16 @@ const router = createRouter({
       path: "/shop",
       name: "home",
       component: HomeView,
+    },
+    {
+      path: "/:catKey(\\d+-[^/]+)/",
+      name: "category-seo",
+      component: HomeView,
+    },
+    {
+      path: "/:catKey(\\d+-[^/]+)/:prodKey(\\d+-[^/]+)",
+      name: "product-seo",
+      component: ProductView,
     },
     {
       path: "/product/:pid",
